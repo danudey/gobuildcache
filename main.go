@@ -196,7 +196,10 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 			resp := &response{ID: req.ID}
 
 			defer func() {
-				if req.Command != cmdClose {
+				// Only stat and populate response fields if we have a valid
+				// DiskPath. On cache miss, DiskPath is empty and we should not
+				// attempt to stat it (which would fail and incorrectly set Err).
+				if req.Command != cmdClose && resp.DiskPath != "" {
 					fi, err := os.Stat(resp.DiskPath)
 					if err != nil {
 						resp.Err = err.Error()
