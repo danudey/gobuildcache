@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
@@ -103,12 +104,24 @@ func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string
 	actionPathname := filepath.Join(d.cacheDir, actionDir, actionID)
 	outputPathname := filepath.Join("..", outputDir, outputID)
 
-	err := os.Symlink(outputPathname, actionPathname)
-	if errors.Is(err, os.ErrExist) {
+	// Check if existing symlink already points to the correct output
+	existing, err := os.Readlink(actionPathname)
+	if err == nil && existing == outputPathname {
 		return true, nil
 	}
 
-	return false, err
+	// Atomically create/replace symlink by creating at temp path then renaming
+	tmpPathname := fmt.Sprintf("%s.tmp.%x", actionPathname, rand.Uint64())
+	// Conceivably the temporary filename could already exist and this would
+	// error, but it seems unlikely enough to not worry about.
+	if err := os.Symlink(outputPathname, tmpPathname); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmpPathname, actionPathname); err != nil {
+		os.Remove(tmpPathname)
+		return false, err
+	}
+	return false, nil
 }
 
 func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (string, error) {
