@@ -23,6 +23,11 @@ import (
 const (
 	actionDir = "action"
 	outputDir = "output"
+
+	// How long a recorded "this action has no output in the bucket" marker
+	// suppresses re-checking. Long enough to prevent hammering during a single
+	// build, short enough that a freshly-uploaded entry becomes visible soon.
+	emptyMarkerTTL = 10 * time.Minute
 )
 
 // isValidID reports whether s is safe to use as a cache ID embedded in a
@@ -166,9 +171,12 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	// The downside is that if at some point it does exist in remote storage, we might not
 	// immediately observe that.
 	cacheEmptyOutputPath := filepath.Join(b.disk.cacheDir, actionDir, actionID+".empty")
-	if _, err := os.Stat(cacheEmptyOutputPath); err == nil {
-		slog.Debug("empty found", "action", actionID, "output", outputID)
-		return "", nil
+	if fi, err := os.Stat(cacheEmptyOutputPath); err == nil {
+		if time.Since(fi.ModTime()) < emptyMarkerTTL {
+			slog.Debug("empty found", "action", actionID, "output", outputID)
+			return "", nil
+		}
+		slog.Debug("empty marker expired", "action", actionID)
 	}
 
 	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
