@@ -116,7 +116,11 @@ func (d *Disk) OutputIDFromAction(ctx context.Context, actionID string) (string,
 		return "", err
 	}
 
-	return filepath.Base(outputPathname), nil
+	outputID := filepath.Base(outputPathname)
+	if !isValidID(outputID) {
+		return "", fmt.Errorf("invalid output id %q in action symlink %s", outputID, actionPathname)
+	}
+	return outputID, nil
 }
 
 func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
