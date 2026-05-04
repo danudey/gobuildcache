@@ -256,7 +256,7 @@ func (b *Bucket) Start(ctx context.Context) {
 	b.jobs = make(chan string, 1000)
 
 	// 20 workers ought to be enough for anybody
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		b.wg.Add(1)
 		go func() {
 			defer b.wg.Done()
