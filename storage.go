@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -282,6 +284,14 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	}
 	if err != nil {
 		return "", err
+	}
+
+	// outputID is the SHA256 of the cached content (per Go's cache protocol).
+	// Verify before persisting so a poisoned bucket can't feed mismatched bytes
+	// into the build.
+	sum := sha256.Sum256(buf.Bytes())
+	if got := hex.EncodeToString(sum[:]); got != outputID {
+		return "", fmt.Errorf("output %s hash mismatch: got %s", outputID, got)
 	}
 
 	slog.Debug("putting download to disk", "output", outputID, "size", buf.Len())
