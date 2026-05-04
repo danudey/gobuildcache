@@ -299,29 +299,49 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 
 	slog.Debug("downloading", "output", outputID)
 
-	buf := new(bytes.Buffer)
-	err = b.bucket.Download(ctx, path.Join(outputDir, outputID), buf, &blob.ReaderOptions{})
-	slog.Debug("downloaded", "output", outputID, "err", err)
+	rdr, err := b.bucket.NewReader(ctx, path.Join(outputDir, outputID), nil)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
+	defer rdr.Close()
+
+	f, err := os.CreateTemp(b.disk.cacheDir, "output")
+	if err != nil {
+		return "", fmt.Errorf("creating temporary output file: %w", err)
+	}
+	keep := false
+	defer func() {
+		f.Close()
+		if !keep {
+			os.Remove(f.Name())
+		}
+	}()
 
 	// outputID is the SHA256 of the cached content (per Go's cache protocol).
-	// Verify before persisting so a poisoned bucket can't feed mismatched bytes
+	// Hash while streaming so a poisoned bucket can't feed mismatched bytes
 	// into the build.
-	sum := sha256.Sum256(buf.Bytes())
-	if got := hex.EncodeToString(sum[:]); got != outputID {
+	h := sha256.New()
+	size, err := io.Copy(io.MultiWriter(f, h), rdr)
+	if err != nil {
+		return "", fmt.Errorf("downloading output: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("flushing output: %w", err)
+	}
+
+	if got := hex.EncodeToString(h.Sum(nil)); got != outputID {
 		return "", fmt.Errorf("output %s hash mismatch: got %s", outputID, got)
 	}
 
-	slog.Debug("putting download to disk", "output", outputID, "size", buf.Len())
+	if err := os.Rename(f.Name(), pathname); err != nil {
+		return "", fmt.Errorf("renaming output: %w", err)
+	}
+	keep = true
 
-	pathname, _, err = b.disk.PutOutput(ctx, outputID, bytes.NewReader(buf.Bytes()))
+	slog.Debug("downloaded to disk", "output", outputID, "size", size)
 
-	slog.Debug("putting download to disk done", "output", outputID, "size", buf.Len())
-
-	return pathname, err
+	return pathname, nil
 }
