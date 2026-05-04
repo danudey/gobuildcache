@@ -183,7 +183,9 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	slog.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		slog.Debug("created found", "action", actionID, "output", outputID)
-		os.WriteFile(cacheEmptyOutputPath, nil, 0o600)
+		if err := os.WriteFile(cacheEmptyOutputPath, nil, 0o600); err != nil {
+			slog.Warn("writing empty marker", "action", actionID, "err", err)
+		}
 		return "", nil
 	}
 	if err != nil {
@@ -200,7 +202,9 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	}
 
 	slog.Debug("linking action to output from output from action", "action", actionID, "output", outputID)
-	b.disk.LinkActionToOutput(ctx, actionID, outputID)
+	if _, err := b.disk.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+		slog.Warn("linking action to output", "action", actionID, "output", outputID, "err", err)
+	}
 
 	return outputID, nil
 }
