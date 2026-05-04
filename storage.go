@@ -66,6 +66,8 @@ type Bucket struct {
 	bucket *blob.Bucket
 	jobs   chan string
 	wg     sync.WaitGroup
+
+	closeOnce sync.Once
 }
 
 func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
@@ -217,9 +219,24 @@ func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (s
 	}
 
 	slog.Debug("scheduling upload", "path", pathname)
-	b.jobs <- pathname
+	if err := b.enqueueUpload(pathname); err != nil {
+		return pathname, false, err
+	}
 
 	return pathname, false, nil
+}
+
+// enqueueUpload sends to the job channel, recovering if a concurrent Close
+// has shut it down. A protocol-conformant driver issues no puts after close,
+// but a malformed one would otherwise panic the process.
+func (b *Bucket) enqueueUpload(pathname string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("upload queue closed: %v", r)
+		}
+	}()
+	b.jobs <- pathname
+	return nil
 }
 
 func (b *Bucket) Start(ctx context.Context) {
@@ -253,13 +270,15 @@ func (b *Bucket) Start(ctx context.Context) {
 }
 
 func (b *Bucket) Close() {
-	slog.Debug("waiting for uploads...")
+	b.closeOnce.Do(func() {
+		slog.Debug("waiting for uploads...")
 
-	now := time.Now()
-	close(b.jobs)
-	b.wg.Wait()
+		now := time.Now()
+		close(b.jobs)
+		b.wg.Wait()
 
-	slog.Debug("waited for uploads", "took", time.Since(now))
+		slog.Debug("waited for uploads", "took", time.Since(now))
+	})
 }
 
 func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error) {
