@@ -142,10 +142,10 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket}
 	cacher.bucket.Start(ctx)
 
-	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, actionDir), 0o777); err != nil {
+	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, actionDir), 0o755); err != nil {
 		return fmt.Errorf("creating cache action dir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, outputDir), 0o777); err != nil {
+	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, outputDir), 0o755); err != nil {
 		return fmt.Errorf("creating cache output dir: %w", err)
 	}
 
