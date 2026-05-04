@@ -89,7 +89,7 @@ func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (str
 	if err != nil {
 		return "", false, fmt.Errorf("creating temporary output file: %w", err)
 	}
-	defer os.RemoveAll(f.Name())
+	defer os.Remove(f.Name())
 	defer f.Close()
 
 	_, err = io.Copy(f, r)
@@ -217,7 +217,7 @@ func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID stri
 
 	return false, b.bucket.Upload(ctx, path.Join(actionDir, actionID), bytes.NewReader(nil), &blob.WriterOptions{
 		Metadata:    map[string]string{"output_id": outputID},
-		ContentType: "plain/text",
+		ContentType: "text/plain",
 	})
 }
 
