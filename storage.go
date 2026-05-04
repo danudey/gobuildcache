@@ -23,6 +23,23 @@ const (
 	outputDir = "output"
 )
 
+// isValidID reports whether s is safe to use as a cache ID embedded in a
+// filesystem path. IDs we generate are lowercase hex from hex.EncodeToString;
+// values arriving from untrusted sources (bucket metadata, on-disk symlink
+// targets) must be rejected before they can drive path traversal.
+func isValidID(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 type OutputInfo struct {
 	ID   string
 	Path string
@@ -161,6 +178,9 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	if outputID == "" {
 		slog.Debug("no metadata output id", "action", actionID, "output", outputID)
 		return "", nil
+	}
+	if !isValidID(outputID) {
+		return "", fmt.Errorf("invalid output_id %q in bucket metadata for action %s", outputID, actionID)
 	}
 
 	slog.Debug("linking action to output from output from action", "action", actionID, "output", outputID)
