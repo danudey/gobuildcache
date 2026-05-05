@@ -8,14 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/charmbracelet/log"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
 )
@@ -73,6 +74,107 @@ type Bucket struct {
 	wg     sync.WaitGroup
 
 	closeOnce sync.Once
+
+	stats cacheStats
+}
+
+type cacheStats struct {
+	actionDiskHits        atomic.Int64
+	actionDiskRequests    atomic.Int64
+	actionBucketHits      atomic.Int64
+	actionBucketRequests  atomic.Int64
+	outputDiskHits        atomic.Int64
+	outputDiskRequests    atomic.Int64
+	outputBucketHits      atomic.Int64
+	outputBucketRequests  atomic.Int64
+	outputBucketTotalNano atomic.Int64
+}
+
+func (c *cacheStats) actionDiskPercent() float32 {
+	if c.actionDiskRequests.Load() == 0 {
+		return float32(0)
+	}
+	return float32(c.actionDiskHits.Load()) / float32(c.actionDiskRequests.Load()) * 100
+}
+
+func (c *cacheStats) actionBucketPercent() float32 {
+	if c.actionBucketRequests.Load() == 0 {
+		return float32(0)
+	}
+	return float32(c.actionBucketHits.Load()) / float32(c.actionBucketRequests.Load()) * 100
+}
+
+func (c *cacheStats) outputDiskPercent() float32 {
+	if c.outputDiskRequests.Load() == 0 {
+		return float32(0)
+	}
+	return float32(c.outputDiskHits.Load()) / float32(c.outputDiskRequests.Load()) * 100
+}
+
+func (c *cacheStats) outputBucketPercent() float32 {
+	if c.outputBucketRequests.Load() == 0 {
+		return float32(0)
+	}
+	return float32(c.outputBucketHits.Load()) / float32(c.outputBucketRequests.Load()) * 100
+}
+
+func (c *cacheStats) actionDiskStats() string {
+	return fmt.Sprintf("%d/%d (%6.2f%%)",
+		c.actionDiskHits.Load(),
+		c.actionDiskRequests.Load(),
+		c.actionDiskPercent(),
+	)
+}
+
+func (c *cacheStats) actionBucketStats() string {
+	return fmt.Sprintf("%d/%d (%6.2f%%)",
+		c.actionBucketHits.Load(),
+		c.actionBucketRequests.Load(),
+		c.actionBucketPercent(),
+	)
+}
+
+func (c *cacheStats) outputDiskStats() string {
+	return fmt.Sprintf("%d/%d (%6.2f%%)",
+		c.outputDiskHits.Load(),
+		c.outputDiskRequests.Load(),
+		c.outputDiskPercent(),
+	)
+}
+func (c *cacheStats) outputBucketStats() string {
+	return fmt.Sprintf("%d/%d (%6.2f%%)",
+		c.outputBucketHits.Load(),
+		c.outputBucketRequests.Load(),
+		c.outputBucketPercent(),
+	)
+}
+
+func (c *cacheStats) outputBucketLatency() string {
+	return fmt.Sprintf("total: %s average: %s",
+		c.outputBucketTotalDuration(),
+		c.outputBucketAverageDuration(),
+	)
+}
+
+func (c *cacheStats) outputBucketTotalDuration() time.Duration {
+	return time.Duration(c.outputBucketTotalNano.Load())
+}
+
+func (c *cacheStats) outputBucketAverageDuration() time.Duration {
+	requests := c.outputBucketRequests.Load()
+	if requests == 0 {
+		return 0
+	}
+	return time.Duration(c.outputBucketTotalNano.Load() / requests)
+}
+
+func (b *Bucket) logStats() {
+	logFmt := "%15s %20s"
+	log.Infof(logFmt, "action_disk", b.stats.actionDiskStats())
+	log.Infof(logFmt, "action_bucket", b.stats.actionBucketStats())
+	log.Infof(logFmt, "output_disk", b.stats.outputDiskStats())
+	log.Infof(logFmt, "output_bucket", b.stats.outputBucketStats())
+	log.Infof(logFmt, "latency", b.stats.outputBucketLatency())
 }
 
 func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
@@ -83,7 +185,7 @@ func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (str
 		return outputPathname, true, nil
 	}
 
-	slog.Debug("persisting to disk", "path", outputPathname)
+	log.Debug("persisting to disk", "path", outputPathname)
 
 	f, err := os.CreateTemp(d.cacheDir, "output")
 	if err != nil {
@@ -160,8 +262,10 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		return "", fmt.Errorf("output id from action (disk): %w", err)
 	}
 
+	b.stats.actionDiskRequests.Add(1)
 	if outputID != "" {
-		slog.Debug("returning output id", "action", actionID, "output", outputID)
+		b.stats.actionDiskHits.Add(1)
+		log.Debug("returning output id", "action", actionID, "output", outputID)
 		return outputID, nil
 	}
 
@@ -171,20 +275,21 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	// The downside is that if at some point it does exist in remote storage, we might not
 	// immediately observe that.
 	cacheEmptyOutputPath := filepath.Join(b.disk.cacheDir, actionDir, actionID+".empty")
+	b.stats.actionBucketRequests.Add(1)
 	if fi, err := os.Stat(cacheEmptyOutputPath); err == nil {
 		if time.Since(fi.ModTime()) < emptyMarkerTTL {
-			slog.Debug("empty found", "action", actionID, "output", outputID)
+			log.Debug("empty found", "action", actionID, "output", outputID)
 			return "", nil
 		}
-		slog.Debug("empty marker expired", "action", actionID)
+		log.Debug("empty marker expired", "action", actionID)
 	}
 
 	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
-	slog.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
+	log.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
-		slog.Debug("created found", "action", actionID, "output", outputID)
+		log.Debug("created found", "action", actionID, "output", outputID)
 		if err := os.WriteFile(cacheEmptyOutputPath, nil, 0o600); err != nil {
-			slog.Warn("writing empty marker", "action", actionID, "err", err)
+			log.Warn("writing empty marker", "action", actionID, "err", err)
 		}
 		return "", nil
 	}
@@ -194,16 +299,17 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 
 	outputID = attr.Metadata["output_id"]
 	if outputID == "" {
-		slog.Debug("no metadata output id", "action", actionID, "output", outputID)
+		log.Debug("no metadata output id", "action", actionID, "output", outputID)
 		return "", nil
 	}
 	if !isValidID(outputID) {
 		return "", fmt.Errorf("invalid output_id %q in bucket metadata for action %s", outputID, actionID)
 	}
+	b.stats.actionBucketHits.Add(1)
 
-	slog.Debug("linking action to output from output from action", "action", actionID, "output", outputID)
+	log.Debug("linking action to output from output from action", "action", actionID, "output", outputID)
 	if _, err := b.disk.LinkActionToOutput(ctx, actionID, outputID); err != nil {
-		slog.Warn("linking action to output", "action", actionID, "output", outputID, "err", err)
+		log.Warn("linking action to output", "action", actionID, "output", outputID, "err", err)
 	}
 
 	return outputID, nil
@@ -230,7 +336,7 @@ func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (s
 		return pathname, true, nil
 	}
 
-	slog.Debug("scheduling upload", "path", pathname)
+	log.Debug("scheduling upload", "path", pathname)
 	if err := b.enqueueUpload(pathname); err != nil {
 		return pathname, false, err
 	}
@@ -264,7 +370,7 @@ func (b *Bucket) Start(ctx context.Context) {
 			for pathname := range b.jobs {
 				f, err := os.Open(pathname)
 				if err != nil {
-					slog.Error("opening file for upload", "path", pathname, "err", err)
+					log.Error("opening file for upload", "path", pathname, "err", err)
 					continue
 				}
 
@@ -272,9 +378,9 @@ func (b *Bucket) Start(ctx context.Context) {
 				err = b.bucket.Upload(ctx, path.Join(outputDir, filepath.Base(pathname)), f, &blob.WriterOptions{ContentType: "application/octet-stream"})
 				f.Close()
 				if err != nil {
-					slog.Error("uploading file", "path", pathname, "err", err, "took", time.Since(now))
+					log.Error("uploading file", "path", pathname, "err", err, "took", time.Since(now))
 				} else {
-					slog.Debug("uploaded file", "path", pathname, "took", time.Since(now))
+					log.Debug("uploaded file", "path", pathname, "took", time.Since(now))
 				}
 			}
 		}()
@@ -283,39 +389,45 @@ func (b *Bucket) Start(ctx context.Context) {
 
 func (b *Bucket) Close() {
 	b.closeOnce.Do(func() {
-		slog.Debug("waiting for uploads...")
+		log.Debug("waiting for uploads...")
 
 		now := time.Now()
 		close(b.jobs)
 		b.wg.Wait()
 
-		slog.Debug("waited for uploads", "took", time.Since(now))
+		log.Debug("waited for uploads", "took", time.Since(now))
 	})
 }
 
 func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error) {
-	slog.Debug("getting output from disk", "output", outputID)
+	log.Debug("getting output from disk", "output", outputID)
+	b.stats.outputDiskRequests.Add(1)
 
 	pathname, err := b.disk.GetOutput(ctx, outputID)
 	if err != nil {
 		return "", err
 	}
 
-	slog.Debug("got output from disk", "output", outputID, "path", pathname, "err", err)
+	log.Debug("got output from disk", "output", outputID, "path", pathname, "err", err)
 
 	if _, err := os.Stat(pathname); err == nil {
-		slog.Debug("returning pathname", "output", outputID, "path", pathname)
+		b.stats.outputDiskHits.Add(1)
+		log.Debug("returning pathname", "output", outputID, "path", pathname)
 
 		return pathname, nil
 	}
 
-	slog.Debug("downloading", "output", outputID)
+	log.Debug("downloading", "output", outputID)
+	b.stats.outputBucketRequests.Add(1)
 
+	fetchStart := time.Now()
 	rdr, err := b.bucket.NewReader(ctx, path.Join(outputDir, outputID), nil)
 	if gcerrors.Code(err) == gcerrors.NotFound {
+		b.stats.outputBucketTotalNano.Add(time.Since(fetchStart).Nanoseconds())
 		return "", nil
 	}
 	if err != nil {
+		b.stats.outputBucketTotalNano.Add(time.Since(fetchStart).Nanoseconds())
 		return "", err
 	}
 	defer rdr.Close()
@@ -337,6 +449,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	// into the build.
 	h := sha256.New()
 	size, err := io.Copy(io.MultiWriter(f, h), rdr)
+	b.stats.outputBucketTotalNano.Add(time.Since(fetchStart).Nanoseconds())
 	if err != nil {
 		return "", fmt.Errorf("downloading output: %w", err)
 	}
@@ -352,8 +465,9 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		return "", fmt.Errorf("renaming output: %w", err)
 	}
 	keep = true
+	b.stats.outputBucketHits.Add(1)
 
-	slog.Debug("downloaded to disk", "output", outputID, "size", size)
+	log.Debug("downloaded to disk", "output", outputID, "size", size)
 
 	return pathname, nil
 }

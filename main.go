@@ -10,13 +10,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/log"
+	"github.com/charmbracelet/x/term"
 	"gocloud.dev/blob"
 	_ "gocloud.dev/blob/azureblob"
 	_ "gocloud.dev/blob/fileblob"
@@ -74,7 +76,7 @@ type Cacher struct {
 func (c *Cacher) Get(ctx context.Context, req *request) (string, error) {
 	actionID := hex.EncodeToString(req.ActionID)
 
-	slog.Debug("get", "action", actionID)
+	log.Debug("get", "action", actionID)
 
 	outputID, err := c.bucket.OutputIDFromAction(ctx, actionID)
 	if err != nil {
@@ -84,14 +86,14 @@ func (c *Cacher) Get(ctx context.Context, req *request) (string, error) {
 		return "", nil
 	}
 
-	slog.Debug("single flight get", "action", actionID, "output", outputID)
+	log.Debug("single flight get", "action", actionID, "output", outputID)
 	pathname, err, shared := c.flight.Do("get"+outputID, func() (any, error) {
 		return c.bucket.GetOutput(ctx, outputID)
 	})
-	slog.Debug("single flight get done", "action", actionID, "output", outputID)
+	log.Debug("single flight get done", "action", actionID, "output", outputID)
 
 	if shared {
-		slog.Debug("get output shared", "output", outputID)
+		log.Debug("get output shared", "output", outputID)
 	}
 
 	return pathname.(string), err
@@ -101,7 +103,7 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	actionID := hex.EncodeToString(req.ActionID)
 	outputID := hex.EncodeToString(req.OutputID)
 
-	slog.Debug("put", "action", actionID, "output", outputID)
+	log.Debug("put", "action", actionID, "output", outputID)
 
 	pathname, err, shared := c.flight.Do("put"+outputID, func() (any, error) {
 		pathname, _, err := c.bucket.PutOutput(ctx, outputID, req.Body)
@@ -109,7 +111,7 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	})
 
 	if shared {
-		slog.Debug("put output shared", "output", outputID)
+		log.Debug("put output shared", "output", outputID)
 	}
 
 	if err != nil {
@@ -124,12 +126,7 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	return pathname.(string), err
 }
 
-func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return fmt.Errorf("getting cache dir: %w", err)
-	}
-
+func run(ctx context.Context, prefix, cachePath, bucketURL string, readonly bool) error {
 	bucket, err := blob.OpenBucket(ctx, bucketURL)
 	if err != nil {
 		return fmt.Errorf("opening bucket: %w", err)
@@ -137,7 +134,7 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 	defer bucket.Close()
 	bucket = blob.PrefixedBucket(bucket, prefix)
 
-	return serve(ctx, bucket, filepath.Join(cacheDir, ".gocachebucket"), readonly, os.Stdin, originalStdout)
+	return serve(ctx, bucket, cachePath, readonly, os.Stdin, originalStdout)
 }
 
 func serve(ctx context.Context, bucket *blob.Bucket, cacheDir string, readonly bool, in io.Reader, out io.Writer) error {
@@ -146,6 +143,7 @@ func serve(ctx context.Context, bucket *blob.Bucket, cacheDir string, readonly b
 	}
 	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket}
 	cacher.bucket.Start(ctx)
+	defer cacher.bucket.logStats()
 
 	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, actionDir), 0o755); err != nil {
 		return fmt.Errorf("creating cache action dir: %w", err)
@@ -221,10 +219,10 @@ func handleRequest(ctx context.Context, c *Cacher, req *request) *response {
 		now := time.Now()
 		resp.DiskPath, err = c.Get(ctx, req)
 		if err != nil {
-			slog.Error("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
+			log.Error("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
 			resp.Err = err.Error()
 		} else {
-			slog.Debug("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
+			log.Debug("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
 		}
 		if resp.DiskPath == "" {
 			resp.Miss = true
@@ -234,10 +232,10 @@ func handleRequest(ctx context.Context, c *Cacher, req *request) *response {
 		now := time.Now()
 		resp.DiskPath, err = c.Put(ctx, req)
 		if err != nil {
-			slog.Error("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
+			log.Error("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
 			resp.Err = err.Error()
 		} else {
-			slog.Debug("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
+			log.Debug("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
 		}
 	}
 
@@ -275,11 +273,15 @@ func init() {
 
 func main() {
 	var prefix string
+	var cachePath string
+	var cpuProfile string
 	var verbose bool
 	var readonly bool
 	var envmap flagArray
 
 	flag.StringVar(&prefix, "p", "", "prefix")
+	flag.StringVar(&cachePath, "c", "", "cache-dir")
+	flag.StringVar(&cpuProfile, "cpuprofile", "", "write cpu profile to file")
 	flag.BoolVar(&verbose, "v", false, "verbose")
 	flag.BoolVar(&readonly, "readonly", false, "readonly")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
@@ -288,6 +290,15 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if cachePath == "" {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			log.Error("failed to detect user's cache dir", "err", err)
+			os.Exit(1)
+		}
+		cachePath = filepath.Join(cacheDir, ".gocachebucket")
+	}
 
 	for _, env := range envmap {
 		key, val, ok := strings.Cut(env, "=")
@@ -302,14 +313,32 @@ func main() {
 		os.Exit(1)
 	}
 
-	level := slog.LevelInfo
+	level := log.InfoLevel
 	if verbose {
-		level = slog.LevelDebug
+		level = log.DebugLevel
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	log.SetLevel(level)
 
-	if err := run(context.Background(), prefix, flag.Arg(0), readonly); err != nil {
-		slog.Error("run error", "err", err)
+	if !term.IsTerminal(os.Stderr.Fd()) {
+		log.SetFormatter(log.LogfmtFormatter)
+	}
+
+	log.Info("Using cache dir", "cachePath", cachePath)
+	log.Info("Using gcp bucket", "bucket", flag.Arg(0))
+
+	if cpuProfile != "" {
+		f, err := os.Create(cpuProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+		log.Info("Saving CPU profile", "cpuProfile", cpuProfile)
+
+	}
+
+	if err := run(context.Background(), prefix, cachePath, flag.Arg(0), readonly); err != nil {
+		log.Error("run error", "err", err)
 		os.Exit(1)
 	}
 }
