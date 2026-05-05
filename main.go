@@ -17,9 +17,9 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/charmbracelet/log"
 	"github.com/charmbracelet/x/term"
-	"gocloud.dev/blob"
 	_ "gocloud.dev/blob/azureblob"
 	_ "gocloud.dev/blob/fileblob"
 	_ "gocloud.dev/blob/gcsblob"
@@ -126,22 +126,21 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	return pathname.(string), err
 }
 
-func run(ctx context.Context, prefix, cachePath, bucketURL string, readonly bool) error {
-	bucket, err := blob.OpenBucket(ctx, bucketURL)
+func run(ctx context.Context, prefix, cachePath, bucketName string, readonly bool) error {
+	// bucket, err := blob.OpenBucket(ctx, bucketURL)
+	client, err := storage.NewGRPCClient(ctx)
+	bucket := client.Bucket(bucketName)
 	if err != nil {
 		return fmt.Errorf("opening bucket: %w", err)
 	}
-	defer bucket.Close()
-	bucket = blob.PrefixedBucket(bucket, prefix)
-
-	return serve(ctx, bucket, cachePath, readonly, os.Stdin, originalStdout)
+	return serve(ctx, bucket, prefix, cachePath, readonly, os.Stdin, originalStdout)
 }
 
-func serve(ctx context.Context, bucket *blob.Bucket, cacheDir string, readonly bool, in io.Reader, out io.Writer) error {
+func serve(ctx context.Context, bucket *storage.BucketHandle, prefix, cacheDir string, readonly bool, in io.Reader, out io.Writer) error {
 	cacher := &Cacher{
 		disk: &Disk{cacheDir: cacheDir},
 	}
-	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket}
+	cacher.bucket = &Bucket{disk: cacher.disk, prefix: prefix, bucket: bucket}
 	cacher.bucket.Start(ctx)
 	defer cacher.bucket.logStats()
 

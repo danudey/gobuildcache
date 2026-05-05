@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,8 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/charmbracelet/log"
-	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
 )
 
@@ -69,7 +68,8 @@ type Disk struct {
 
 type Bucket struct {
 	disk   *Disk
-	bucket *blob.Bucket
+	prefix string
+	bucket *storage.BucketHandle
 	jobs   chan string
 	wg     sync.WaitGroup
 
@@ -284,9 +284,13 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		log.Debug("empty marker expired", "action", actionID)
 	}
 
-	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
+	attr, err := b.bucket.Object(path.Join(actionDir, actionID)).Attrs(ctx)
+	if err != nil {
+		log.Debug("could not get object attributes for file", "filename", path.Join(actionDir, actionID), "err", err)
+	}
+
 	log.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
-	if gcerrors.Code(err) == gcerrors.NotFound {
+	if errors.Is(err, storage.ErrObjectNotExist) {
 		log.Debug("created found", "action", actionID, "output", outputID)
 		if err := os.WriteFile(cacheEmptyOutputPath, nil, 0o600); err != nil {
 			log.Warn("writing empty marker", "action", actionID, "err", err)
@@ -321,10 +325,22 @@ func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID stri
 		return exists, err
 	}
 
-	return false, b.bucket.Upload(ctx, path.Join(actionDir, actionID), bytes.NewReader(nil), &blob.WriterOptions{
+	obj := b.bucket.Object(path.Join(actionDir, actionID))
+	w := obj.NewWriter(ctx)
+	if _, err := fmt.Fprintf(w, ""); err != nil {
+		log.Error("failed to write to new action object")
+	}
+	_ = w.Close()
+	attrs := storage.ObjectAttrsToUpdate{
 		Metadata:    map[string]string{"output_id": outputID},
 		ContentType: "text/plain",
-	})
+	}
+
+	_, err = obj.Update(ctx, attrs)
+	if err != nil {
+		panic(err)
+	}
+	return false, err
 }
 
 func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
@@ -375,13 +391,18 @@ func (b *Bucket) Start(ctx context.Context) {
 				}
 
 				now := time.Now()
-				err = b.bucket.Upload(ctx, path.Join(outputDir, filepath.Base(pathname)), f, &blob.WriterOptions{ContentType: "application/octet-stream"})
-				f.Close()
-				if err != nil {
+				obj := b.bucket.Object(path.Join(outputDir, filepath.Base(pathname)))
+				w := obj.NewWriter(ctx)
+				if _, err := io.Copy(w, f); err != nil {
 					log.Error("uploading file", "path", pathname, "err", err, "took", time.Since(now))
+				}
+				if err := w.Close(); err != nil {
+					log.Error("unable to close bucket writer", "error", err)
 				} else {
 					log.Debug("uploaded file", "path", pathname, "took", time.Since(now))
 				}
+				w.Close()
+				f.Close()
 			}
 		}()
 	}
@@ -421,7 +442,8 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	b.stats.outputBucketRequests.Add(1)
 
 	fetchStart := time.Now()
-	rdr, err := b.bucket.NewReader(ctx, path.Join(outputDir, outputID), nil)
+	obj := b.bucket.Object(path.Join(outputDir, outputID))
+	rdr, err := obj.NewReader(ctx)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		b.stats.outputBucketTotalNano.Add(time.Since(fetchStart).Nanoseconds())
 		return "", nil
@@ -438,6 +460,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	}
 	keep := false
 	defer func() {
+		rdr.Close()
 		f.Close()
 		if !keep {
 			os.Remove(f.Name())
