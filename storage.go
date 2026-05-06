@@ -83,6 +83,7 @@ type cacheStats struct {
 	actionDiskRequests    atomic.Int64
 	actionBucketHits      atomic.Int64
 	actionBucketRequests  atomic.Int64
+	actionBucketTotalNano atomic.Int64
 	outputDiskHits        atomic.Int64
 	outputDiskRequests    atomic.Int64
 	outputBucketHits      atomic.Int64
@@ -156,6 +157,13 @@ func (c *cacheStats) outputBucketLatency() string {
 	)
 }
 
+func (c *cacheStats) actionBucketLatency() string {
+	return fmt.Sprintf("total: %s average: %s",
+		c.actionBucketTotalDuration(),
+		c.actionBucketAverageDuration(),
+	)
+}
+
 func (c *cacheStats) outputBucketTotalDuration() time.Duration {
 	return time.Duration(c.outputBucketTotalNano.Load())
 }
@@ -168,13 +176,26 @@ func (c *cacheStats) outputBucketAverageDuration() time.Duration {
 	return time.Duration(c.outputBucketTotalNano.Load() / requests)
 }
 
+func (c *cacheStats) actionBucketTotalDuration() time.Duration {
+	return time.Duration(c.actionBucketTotalNano.Load())
+}
+
+func (c *cacheStats) actionBucketAverageDuration() time.Duration {
+	requests := c.actionBucketRequests.Load()
+	if requests == 0 {
+		return 0
+	}
+	return time.Duration(c.actionBucketTotalNano.Load() / requests)
+}
+
 func (b *Bucket) logStats() {
 	logFmt := "%15s %20s"
 	log.Infof(logFmt, "action_disk", b.stats.actionDiskStats())
 	log.Infof(logFmt, "action_bucket", b.stats.actionBucketStats())
 	log.Infof(logFmt, "output_disk", b.stats.outputDiskStats())
 	log.Infof(logFmt, "output_bucket", b.stats.outputBucketStats())
-	log.Infof(logFmt, "latency", b.stats.outputBucketLatency())
+	log.Infof(logFmt, "object_latency", b.stats.outputBucketLatency())
+	log.Infof(logFmt, "action_latency", b.stats.actionBucketLatency())
 }
 
 func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
@@ -283,8 +304,9 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		}
 		log.Debug("empty marker expired", "action", actionID)
 	}
-
+	fetchStart := time.Now()
 	attr, err := b.bucket.Object(path.Join(actionDir, actionID)).Attrs(ctx)
+	b.stats.actionBucketTotalNano.Add(time.Since(fetchStart).Nanoseconds())
 	if err != nil {
 		log.Debug("could not get object attributes for file", "filename", path.Join(actionDir, actionID), "err", err)
 	}
