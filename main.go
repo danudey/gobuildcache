@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"strings"
 	"sync"
@@ -272,6 +273,7 @@ func main() {
 	var cpuProfile string
 	var verbose bool
 	var readonly bool
+	var maxProcs int
 	var envmap flagArray
 
 	flag.StringVar(&prefix, "p", "", "prefix")
@@ -279,12 +281,17 @@ func main() {
 	flag.StringVar(&cpuProfile, "cpuprofile", "", "write cpu profile to file")
 	flag.BoolVar(&verbose, "v", false, "verbose")
 	flag.BoolVar(&readonly, "readonly", false, "readonly")
+	flag.IntVar(&maxProcs, "maxprocs", 0, "number of concurrent fetches to allow (defaults to GOMAXPROCS)")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "%s <bucket url>\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if maxProcs != 0 {
+		runtime.GOMAXPROCS(maxProcs)
+	}
 
 	if cachePath == "" {
 		cacheDir, err := os.UserCacheDir()
