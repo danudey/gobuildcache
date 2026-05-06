@@ -17,7 +17,8 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/charmbracelet/log"
-	"gocloud.dev/gcerrors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -466,7 +467,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	fetchStart := time.Now()
 	obj := b.bucket.Object(path.Join(outputDir, outputID))
 	rdr, err := obj.NewReader(ctx)
-	if gcerrors.Code(err) == gcerrors.NotFound {
+	if status.Code(err) == codes.NotFound {
 		b.stats.outputBucketTotalNano.Add(time.Since(fetchStart).Nanoseconds())
 		return "", nil
 	}
